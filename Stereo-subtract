@@ -1,0 +1,196 @@
+// based on https://github.com/Nbickford/REAPERDenoiser
+
+desc: Subtract one stereo signal from another (4CH)
+//tags: processing subtraction
+//author: Michael Pannekoek
+
+slider1:3<0,5,1{1024,2048,4096,8192,16384,32768}>FFT Size
+slider2:1<0,3,1{4,8,16,32}>Overlaps
+slider3:1<0,3,1{hamming,hanning,bartlett,blackman}>Window Shape
+slider4:-5<-5,5,0.01>scale at Low Cut
+slider5:-5<-5,5,0.01>scale at High Cut
+slider6:0<0,1,0.001>Low Cut
+slider7:1<0,1,0.001>High Cut
+slider8:mode=0<0,1,1{Denoise,Subtract+denoise}>Mode
+slider9:0<-5,5,0.01>Phase width low
+slider10:0<-5,5,0.01>Phase width high
+slider11:0<-100,30,0.1>Sidechain Gain
+
+in_pin:left input
+in_pin:right input
+in_pin:left sidechain
+in_pin:right sidechain
+out_pin:left output
+out_pin:right output
+
+import cookdsp.jsfx-inc
+
+
+@init
+MAXSIZE = 32768;
+
+strengthBuffer = memalloc(MAXSIZE);
+phaseWBuffer = memalloc(MAXSIZE);
+
+__memory_reset_index = __memory_next;
+
+function init_fft_vars()
+(
+  SIZE = 1 << ((slider1 + 10)|0);
+  OLAPS = 1 << ((slider2 + 2)|0);
+  
+  // re-init ffts when size changed
+  SIZE != fftin_left.size || OLAPS != fftin_left.olaps ? (
+    __memory_next = __memory_reset_index;
+    fftin_left.fftin_resize(SIZE, OLAPS);
+    fftin_right.fftin_resize(SIZE, OLAPS);
+    fftscin_left.fftin_resize(SIZE, OLAPS);
+    fftscin_right.fftin_resize(SIZE, OLAPS);
+    fftout_left.fftout_resize(SIZE, OLAPS);
+    fftout_right.fftout_resize(SIZE, OLAPS);
+    memset(fftin_left.real, 0, SIZE/2+1);
+    memset(fftin_right.real, 0, SIZE/2+1);
+    memset(fftscin_left.real, 0, SIZE/2+1);
+    memset(fftscin_right.real, 0, SIZE/2+1);
+    memset(fftout_left.real, 0, SIZE/2+1);
+    memset(fftout_right.real, 0, SIZE/2+1);
+    memset(fftin_left.imag, 0, SIZE/2+1);
+    memset(fftin_right.imag, 0, SIZE/2+1);
+    memset(fftscin_left.imag, 0, SIZE/2+1);
+    memset(fftscin_right.imag, 0, SIZE/2+1);
+    memset(fftout_left.imag, 0, SIZE/2+1);
+    memset(fftout_right.imag, 0, SIZE/2+1);
+    
+    // tell reaper what delay this plugin will introduce,
+    // so that it can be compensated for
+    pdc_delay = SIZE;
+    // delay is one full buffer
+    pdc_bot_ch = 0; pdc_top_ch = 2;
+    // which channels are delayed
+    // (channel number must be greater than or equal to 0,
+    // but less than 2, so 0 and 1 - LR output).
+  );
+  slider3 != fftin_left.window ? (
+    fftin_left.fftin_set_window(slider3);
+    fftin_right.fftin_set_window(slider3);
+    fftscin_left.fftin_set_window(slider3);
+    fftscin_right.fftin_set_window(slider3);
+    fftout_left.fftout_set_window(slider3);
+    fftout_right.fftout_set_window(slider3);
+  );
+);
+
+fftin_left.fftin(SIZE, OLAPS, slider3);
+fftin_right.fftin(SIZE, OLAPS, slider3);
+fftscin_left.fftin(SIZE, OLAPS, slider3);
+fftscin_right.fftin(SIZE, OLAPS, slider3);
+fftout_left.fftout(SIZE, OLAPS, slider3);
+fftout_right.fftout(SIZE, OLAPS, slider3);
+
+init_fft_vars();
+
+@slider
+function ensurebounds(val, mi, ma) (
+  min(ma, max(mi, val))
+);
+
+scg = 10^(slider11/20);
+
+init_fft_vars();
+
+// convert low cut and high cut to bins every time a slider is changed
+lowBin = floor(ensurebounds(min(slider6, slider7), 0, 1) * SIZE/2);
+// do not process band 0!
+highBin = ceil(ensurebounds(max(slider6, slider7), 0, 1) * SIZE/2);
+// convert percentage to raw scale factor
+lowStrength = exp(slider4);
+highStrength = exp(slider5);
+
+phaseWlow = exp(slider9);
+phaseWhigh = exp(slider10);
+// fill strengthBuffer and phaseWBuffer
+// only set values for the appropriate frequency range
+bandIndex = lowBin;
+loop(highBin - lowBin,
+  frac = (bandIndex - lowBin)/(highBin - lowBin - 1);
+  // fraction of progress through range [lowBin, highBin)
+  strengthBuffer[bandIndex] = lowStrength^(1 - frac) * highStrength^frac;
+  phaseWBuffer[bandIndex] = phaseWlow^(1 - frac) * phaseWhigh^frac;
+  bandIndex += 1;
+);
+
+
+@sample
+fftin_left.fftin_do(mode == 1 ? spl0 - spl2 * scg : spl0);
+fftin_right.fftin_do(mode == 1 ? spl1 - spl3 * scg : spl1);
+fftscin_left.fftin_do(spl2 * scg);
+fftscin_right.fftin_do(spl3 * scg);
+
+spl0 = fftout_left.fftout_get_output(fftin_left.count);
+spl1 = fftout_right.fftout_get_output(fftin_left.count);
+
+function get_attenuation(sreal, simag, nreal, nimag, strength, phase_width)
+(
+  phase_difference = abs(atan2(
+    sreal*nimag - simag*nreal,
+    sreal*nreal + simag*nimag
+  )) / $pi;
+  weight1 = (1-phase_difference)^(phase_width);
+  normS = sreal * sreal + simag * simag;
+  normN = nreal * nreal + nimag * nimag;
+  weight2 = sqr(normS / (normS + strength * normN));
+  weight1 * weight2;
+);
+
+fftin_left.ready ? (
+  // Subract Right fft from left:
+  // which an algorithm simmilar to Neil Bickford's
+  // Reaper Denoiser - orignially based off Wiener deconvolution
+  memset(fftin_left.real, 0, lowBin);
+  memset(fftin_left.imag, 0, lowBin);
+  memset(fftin_right.real, 0, lowBin);
+  memset(fftin_right.imag, 0, lowBin);
+  bandIndex = lowBin;
+  loop(highBin - lowBin,
+    strength = strengthBuffer[bandIndex];
+    phase_width = phaseWBuffer[bandIndex];
+    
+    signal_left_real = fftin_left.real[bandIndex];
+    signal_left_imag = fftin_left.imag[bandIndex];
+    signal_right_real = fftin_right.real[bandIndex];
+    signal_right_imag = fftin_right.imag[bandIndex];
+    
+    noise_left_real = fftscin_left.real[bandIndex];
+    noise_left_imag = fftscin_left.imag[bandIndex];
+    noise_right_real = fftscin_right.real[bandIndex];
+    noise_right_imag = fftscin_right.imag[bandIndex];
+    
+    attenuation_left = get_attenuation(
+      signal_left_real, signal_left_imag,
+      noise_left_real, noise_left_imag,
+      strength, phase_width
+    );
+    
+    attenuation_right = get_attenuation(
+      signal_right_real, signal_right_imag,
+      noise_right_real, noise_right_imag,
+      strength, phase_width
+    );
+    
+    fftin_left.real[bandIndex] *= attenuation_left;
+    fftin_left.imag[bandIndex] *= attenuation_left;
+    fftin_right.real[bandIndex] *= attenuation_right;
+    fftin_right.imag[bandIndex] *= attenuation_right;
+        
+    bandIndex += 1;
+  );
+  memset(fftin_left.real + highBin, 0, SIZE/2 + 1 - highBin);
+  memset(fftin_left.imag + highBin, 0, SIZE/2 + 1 - highBin);
+  memset(fftin_right.real + highBin, 0, SIZE/2 + 1 - highBin);
+  memset(fftin_right.imag + highBin, 0, SIZE/2 + 1 - highBin);
+  
+  fftout_left.fftout_do(fftin_left.real, fftin_left.imag);
+  fftout_right.fftout_do(fftin_right.real, fftin_right.imag);
+);
+// sliders are serialized automatically
+// thus nothing to serialize, as nothing else makes sense to store
